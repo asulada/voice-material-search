@@ -1,0 +1,308 @@
+"""API 测试（§6.2 API 表 + §6.6 文件访问边界）。
+
+用 TestClient 打真实路由，覆盖：检索、试听（Range）、标注、重建向量、导出、
+路径穿越防护、任务进度。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from voicelib import audio as A
+
+from conftest import synth_speech
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    """每个测试一个独立库根目录，并强制走哈希嵌入（不联网）。"""
+    monkeypatch.setenv("VOICE_LIBRARY_BGE_INSTRUCTION", "0")
+    root = tmp_path / "voice_library"
+    root.mkdir()
+
+    from voicelib.embedder import HashingEncoder
+
+    import server
+
+    app = server.create_app(str(root))
+    # 用确定性哈希嵌入替换真模型，测试不依赖网络
+    app.state.vl.encoder._impl = HashingEncoder()
+    with TestClient(app) as c:
+        c.state = app.state.vl  # type: ignore[attr-defined]
+        yield c
+
+
+def _seed_dataset(base: Path) -> Path:
+    """造一个 CSEMOTIONS 形态的数据源目录。"""
+    root = base / "CSEMOTIONS"
+    for speaker, seed in (("S03", 0), ("S07", 4)):
+        for emo in ("Angry", "Happy"):
+            d = root / speaker / emo
+            d.mkdir(parents=True)
+            for i in range(3):
+                A.write_wav(d / f"{emo}_{i}.wav", synth_speech(6.0, seed=seed + i), 22050)
+    return root
+
+
+def _run_import(client, src: Path, **kw) -> dict:
+    body = {
+        "kind": "csemotions",
+        "path": str(src),
+        "target_use": "indextts",
+        "license": "apache-2.0",
+        "gender_map": {"S03": "male", "S07": "female"},
+        **kw,
+    }
+    r = client.post("/api/import", json=body)
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+    # 同步等任务结束（单线程池，轮询即可）
+    import time
+
+    for _ in range(200):
+        snap = client.get(f"/api/jobs/{job_id}").json()
+        if snap["status"] in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.05)
+    assert snap["status"] == "done", snap
+    return snap
+
+
+# ------------------------------------------------------------------ 基础
+
+
+def test_health_and_meta(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+    r = client.get("/api/meta")
+    assert r.status_code == 200
+    data = r.json()
+    uses = {u["value"]: u for u in data["uses"]}
+    assert uses["indextts"]["kinds"] == ["speech"]
+    assert uses["seedvc"]["duration"] == [0.3, 5.0]
+    assert data["encoder"]["backend"] == "hash-fallback"
+
+
+def test_import_then_search(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    snap = _run_import(client, src)
+    assert snap["result"]["imported"] == 12
+
+    stats = client.get("/api/stats").json()
+    assert stats["total"] == 12
+    assert stats["by_category"]["Angry"] == 6
+    assert stats["by_gender"]["male"] == 6
+
+    r = client.post("/api/search", json={"use": "indextts", "q": "愤怒男声", "top_k": 5})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 12
+    assert len(data["items"]) == 5
+    item = data["items"][0]
+    # 响应必须含前端渲染所需全部字段（§6.2）
+    for key in ("id", "filepath", "audio_url", "description", "category",
+                "intensity", "gender", "duration_sec", "gain_db", "score",
+                "verified", "commercial_ok"):
+        assert key in item, key
+    assert item["audio_url"] == f"/api/clips/{item['id']}/audio"
+    assert "embedding" not in item, "向量不应返回给前端"
+
+
+def test_search_for_each_line(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    # seedvc 线路应当没有素材
+    r = client.post("/api/search", json={"use": "seedvc"})
+    assert r.json()["total"] == 0
+    # 显式 kinds 覆盖可以查到
+    r = client.post("/api/search", json={"use": "indextts", "kinds": ["vocal_burst"]})
+    assert r.json()["total"] == 0
+
+
+def test_search_filters_land_in_sql(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    r = client.post("/api/search", json={"use": "indextts", "gender": "female", "top_k": 50})
+    items = r.json()["items"]
+    assert items and all(i["gender"] == "female" for i in items)
+    assert len(items) == 6
+
+
+def test_audio_endpoint_serves_file_and_range(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    cid = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]["id"]
+
+    r = client.get(f"/api/clips/{cid}/audio")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/")
+    full = r.content
+    assert len(full) > 1000
+
+    r = client.get(f"/api/clips/{cid}/audio", headers={"Range": "bytes=0-99"})
+    assert r.status_code == 206
+    assert len(r.content) == 100
+    assert r.headers["content-range"].startswith("bytes 0-99/")
+
+
+def test_audio_missing_clip_404(client):
+    assert client.get("/api/clips/99999/audio").status_code == 404
+
+
+def test_path_traversal_blocked(client, tmp_path):
+    """即使 db 里被写入了越界路径，也不能读到库外文件。"""
+    vl = client.state
+    outside = tmp_path / "secret.txt"
+    outside.write_text("top secret", encoding="utf-8")
+    with vl.db.tx() as conn:
+        conn.execute(
+            "INSERT INTO clips (filepath, checksum, target_use, clip_kind, category, "
+            "duration_sec, description, license, commercial_ok) "
+            "VALUES ('../secret.txt', 'x', 'indextts', 'speech', 'Angry', 5.0, 'd', "
+            "'apache-2.0', 1)"
+        )
+        cid = conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
+
+    r = client.get(f"/api/clips/{cid}/audio")
+    assert r.status_code in (403, 404)
+    assert b"top secret" not in r.content
+
+
+def test_patch_clip_updates_and_reembeds(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    cid = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]["id"]
+
+    r = client.patch(f"/api/clips/{cid}", json={"intensity": 5, "verified": 1})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["intensity"] == 5
+    assert data["verified"] == 1
+    assert data["reembedded"] is False  # 描述没改，不重建
+
+    new_desc = "一段刻意压抑的男性愤怒，像在忍着火。"
+    r = client.patch(
+        f"/api/clips/{cid}", json={"description": new_desc}
+    )
+    data = r.json()
+    assert data["description"] == new_desc
+    assert data["reembedded"] is True, "描述改了必须重建向量"
+
+    # 重建后能按新描述检索到
+    r = client.post("/api/search", json={"use": "indextts", "q": "压抑的愤怒", "top_k": 3})
+    assert cid in [i["id"] for i in r.json()["items"]]
+
+
+def test_patch_license_recomputes_commercial_ok(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    cid = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]["id"]
+    assert client.get(f"/api/clips/{cid}").json()["commercial_ok"] == 1
+
+    r = client.patch(f"/api/clips/{cid}", json={"license": "cc-by-nc-sa-4.0"})
+    assert r.json()["commercial_ok"] == 0, "commercial_ok 必须由 license 推导"
+
+    r = client.post("/api/search", json={"use": "indextts", "commercial_only": True, "top_k": 50})
+    assert cid not in [i["id"] for i in r.json()["items"]]
+
+
+def test_reebed_single(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    cid = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]["id"]
+    r = client.post(f"/api/clips/{cid}/reebed", json={"description": "全新的描述文本"})
+    assert r.status_code == 200
+    assert r.json()["description"] == "全新的描述文本"
+    assert client.get(f"/api/clips/{cid}").json()["description"] == "全新的描述文本"
+
+
+def test_waveform(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    cid = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]["id"]
+    r = client.get(f"/api/clips/{cid}/waveform?points=100")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["points"]) == 100
+    assert all(0 <= p <= 1.0001 for p in data["points"])
+    assert data["duration_sec"] > 0
+
+
+def test_export_writes_selection_json(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    items = client.post("/api/search", json={"use": "indextts", "top_k": 3}).json()["items"]
+    ids = [i["id"] for i in items]
+
+    r = client.post("/api/export", json={"clip_ids": ids, "name": "test-export"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["exported"] == 3
+
+    out = Path(data["directory"])
+    assert out.is_dir()
+    manifest = json.loads((out / "selection.json").read_text(encoding="utf-8"))
+    assert manifest["count"] == 3
+    assert len(manifest["clips"]) == 3
+    for item in manifest["clips"]:
+        assert Path(item["export_path"]).is_file()
+        # 导出的是独立文件（IndexTTS 只取前 15 秒，§5.1）
+        assert item["export_path"].endswith(".wav")
+
+    r = client.get("/api/exports")
+    assert any(e["name"] == "test-export" for e in r.json()["exports"])
+
+
+def test_export_missing_ids_reported(client, tmp_path):
+    r = client.post("/api/export", json={"clip_ids": [424242]})
+    assert r.status_code == 200
+    assert r.json()["exported"] == 0
+    assert r.json()["missing"] == [424242]
+
+
+def test_export_empty_selection_rejected(client):
+    assert client.post("/api/export", json={"clip_ids": []}).status_code == 400
+
+
+def test_import_preview(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    r = client.get("/api/import/preview", params={"path": str(src)})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["detected_kind"] == "csemotions"
+    assert data["count"] == 12
+    assert len(data["samples"]) == 12
+
+
+def test_import_bad_path(client):
+    r = client.post("/api/import", json={"kind": "flat", "path": "Z:/does/not/exist"})
+    assert r.status_code == 400
+
+
+def test_job_unknown_404(client):
+    assert client.get("/api/jobs/nope").status_code == 404
+
+
+def test_voices_empty(client):
+    r = client.get("/api/voices")
+    assert r.status_code == 200
+    assert r.json()["voices"] == []
+
+
+def test_delete_clip(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    item = client.post("/api/search", json={"use": "indextts", "top_k": 1}).json()["items"][0]
+    path = client.state.cfg.root_path / item["filepath"]
+    assert path.is_file()
+
+    r = client.delete(f"/api/clips/{item['id']}", params={"delete_file": True})
+    assert r.json()["file_removed"] is True
+    assert not path.is_file()
+    assert client.get(f"/api/clips/{item['id']}").status_code == 404

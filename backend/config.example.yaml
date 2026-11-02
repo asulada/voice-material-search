@@ -1,0 +1,33 @@
+# voice_library/config.yaml 示例
+#
+# 位置：<库根目录>/config.yaml（默认 项目根/voice_library/config.yaml）
+# 库根目录可用环境变量 VOICE_LIBRARY_ROOT 覆盖。
+# 这个文件全部字段都可省略，省略时用默认值。
+
+# 中文嵌入模型（方案 §3.1）。下载到本地后填写路径也可以。
+embed_model: BAAI/bge-small-zh-v1.5
+
+# 试听时统一到多少 LUFS（只用于算 gain_db，不改音频，§4.4）
+target_lufs: -20.0
+
+# 两条线路的时长筛选（秒）
+indextts_duration: [3.0, 15.0]
+seedvc_duration: [0.3, 5.0]
+
+# 预置的数据源目录，导入页会列出来。
+# kind: csemotions | emogator | flat
+scan_roots:
+  - kind: csemotions
+    path: /data/CSEMOTIONS
+    target_use: indextts
+    license: apache-2.0
+    language: zh
+    gender_map:
+      S03: male
+      S07: female
+
+  - kind: emogator
+    path: /data/EmoGator
+    target_use: seedvc
+    license: apache-2.0
+    language: en

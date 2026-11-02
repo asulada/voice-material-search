@@ -1,0 +1,17 @@
+# 运行时数据（库根目录、导出、索引）
+voice_library/
+backend/__pycache__/
+backend/**/__pycache__/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,81 @@
+/* 全局样式：不用 UI 框架（方案 §6.7），原生 CSS 足够。 */
+
+:root {
+  --bg: #14161a;
+  --panel: #1b1e24;
+  --sidebar: #171a1f;
+  --border: #2a2e37;
+  --chip: #232833;
+  --fg: #e6e8ec;
+  --muted: #8a919d;
+  --accent: #4b8ef1;
+  --ok: #34a853;
+  --warn: #e0a030;
+  --danger: #e05a5a;
+  --bar: #3a4150;
+  --toast: #2b3240;
+  --toast-fg: #e6e8ec;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --sidebar: #f0f2f5;
+    --border: #dfe3e9;
+    --chip: #e9edf2;
+    --fg: #1e2228;
+    --muted: #6b7280;
+    --accent: #2f6fdd;
+    --ok: #1e8e3e;
+    --warn: #a86b00;
+    --danger: #c0392b;
+    --bar: #cfd6e0;
+    --toast: #2b3240;
+    --toast-fg: #f2f4f7;
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Noto Sans SC', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bar);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
