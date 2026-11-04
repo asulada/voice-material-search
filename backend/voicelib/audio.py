@@ -161,6 +161,27 @@ def load_audio(path: str | Path, sr: int | None = None) -> tuple[np.ndarray, int
     return y.astype(np.float32), int(actual_sr)
 
 
+def load_audio_bytes(data: bytes, sr: int | None = None) -> tuple[np.ndarray, int]:
+    """从内存字节解码音频（parquet 里内嵌的 wav/flac 等）。
+
+    与 load_audio 行为一致：单声道、float32。
+    用 soundfile 直接读 BytesIO，不必先落成临时文件。
+    """
+    import io
+
+    import soundfile as sf
+
+    y, actual_sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+    if y.ndim > 1:  # 多声道 → 取均值变单声道
+        y = y.mean(axis=1)
+    if sr is not None and int(actual_sr) != sr:
+        import librosa
+
+        y = librosa.resample(y, orig_sr=int(actual_sr), target_sr=sr)
+        actual_sr = sr
+    return y.astype(np.float32), int(actual_sr)
+
+
 def write_wav(path: str | Path, y: np.ndarray, sr: int, subtype: str = "PCM_16") -> None:
     import soundfile as sf
 

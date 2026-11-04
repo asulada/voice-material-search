@@ -7,6 +7,8 @@ librosa>=0.10
 sentence-transformers>=2.7
 pyyaml>=6
 python-multipart>=0.0.9
+# 读取 parquet 数据集（HF datasets 的 Audio 列）。只在导入 parquet 时才用，但装了才能用。
+pyarrow>=14
 
 # 测试
 pytest>=8

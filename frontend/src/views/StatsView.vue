@@ -104,7 +104,7 @@ const distBars = (obj) => {
           <h3>{{ use === 'indextts' ? 'IndexTTS' : 'SeedVC' }}</h3>
           <ul>
             <li v-for="c in list" :key="c.category">
-              <span>{{ c.category }}</span><span class="num">{{ c.count }}</span>
+              <span>{{ c.category_cn || c.category }}</span><span class="num">{{ c.count }}</span>
             </li>
             <li v-if="!list.length" class="muted">暂无</li>
           </ul>

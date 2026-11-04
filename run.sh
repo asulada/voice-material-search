@@ -8,11 +8,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/backend"
 
-PY="${PY:-python3}"
+# 优先用 PATH 里的 python（conda / venv 激活后就是环境里的那个），
+# 再退回 python3。显式设置 PY=... 可覆盖。
+if [ -n "${PY:-}" ]; then
+  :
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  PY=python3
+fi
 PORT="${PORT:-8000}"
 
 if ! "$PY" -c "import fastapi" >/dev/null 2>&1; then
-  echo "缺少依赖。先执行：$PY -m pip install -r requirements.txt" >&2
+  echo "缺少依赖。先激活环境（conda activate / source .venv/bin/activate），再执行：" >&2
+  echo "  $PY -m pip install -r requirements.txt" >&2
   exit 1
 fi
 

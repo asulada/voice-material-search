@@ -34,7 +34,7 @@ class ScanRoot:
       csemotions  —— <root>/<speaker>/<emotion>/*.wav（CSEMOTIONS 原始排布）
       emogator    —— <root>/<label>/*.wav（EmoGator 30 类排布）
       flat        —— 扁平目录，需 manifest.json 提供每条素材的标注
-      huggingface —— HF datasets 数据集名（见 slug），通过 load_dataset 读取
+      parquet     —— HF datasets 的 parquet 分片（音频内嵌在 audio 列）
     """
 
     kind: str

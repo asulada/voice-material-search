@@ -306,3 +306,248 @@ def test_delete_clip(client, tmp_path):
     assert r.json()["file_removed"] is True
     assert not path.is_file()
     assert client.get(f"/api/clips/{item['id']}").status_code == 404
+
+
+# ---------------------------------------------------------------- 语种筛选（前端筛选面板）
+
+def test_search_language_filter_and_endpoint(client, tmp_path):
+    """导入时语言留空 → 全库 NULL → 「未标注」要能筛出来，不能是 0 条。"""
+    src = _seed_dataset(tmp_path)
+    # 一批标 zh，一批留空
+    _run_import(client, src, language="zh")
+    r = client.post("/api/search", json={"use": "indextts", "language": "zh", "top_k": 50})
+    assert r.json()["total"] == 12
+    r = client.post("/api/search", json={"use": "indextts", "language": "", "top_k": 50})
+    assert r.json()["total"] == 0
+
+    # 再导一份不标语种的
+    src2 = tmp_path / "CSEMOTIONS2"
+    for emo in ("Sad",):
+        d = src2 / "S09" / emo
+        d.mkdir(parents=True)
+        for i in range(2):
+            A.write_wav(d / f"{emo}_{i}.wav", synth_speech(6.0, seed=10 + i), 22050)
+    _run_import(client, src2, kind="csemotions", gender_map={"S09": "male"})
+
+    r = client.post("/api/search", json={"use": "indextts", "language": "zh", "top_k": 50})
+    assert r.json()["total"] == 12
+    r = client.post("/api/search", json={"use": "indextts", "language": "", "top_k": 50})
+    unlabeled = r.json()
+    assert unlabeled["total"] == 2
+    assert all(i["language"] is None for i in unlabeled["items"])
+
+    # 筛选面板的语种分布：原值 + 中文名
+    langs = client.get("/api/languages", params={"use": "indextts"}).json()["languages"]
+    by_code = {l["language"]: l for l in langs}
+    assert by_code["zh"]["language_cn"] == "中文" and by_code["zh"]["count"] == 12
+    assert by_code[""]["language_cn"] == "未标注" and by_code[""]["count"] == 2
+
+    stats = client.get("/api/stats").json()
+    assert stats["languages"]["indextts"] == langs
+
+
+# ---------------------------------------------------------------- 音频落盘策略（设置项）
+
+def test_import_audio_mode_keep_via_api(client, tmp_path):
+    """audio_mode=keep 时，已存在的 wav 不被重写，元数据仍刷新。"""
+    import os
+
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    files = sorted((Path(client.state.cfg.root_path) / "audio").rglob("*.wav"))
+    assert files
+    stamp = os.stat(files[0]).st_mtime_ns
+
+    snap = _run_import(client, src, audio_mode="keep")
+    assert snap["result"]["audio_kept"] > 0
+    assert os.stat(files[0]).st_mtime_ns == stamp, "keep 模式不应重写文件"
+
+
+def test_import_audio_mode_overwrite_by_default(client, tmp_path):
+    import os, time
+
+    src = _seed_dataset(tmp_path)
+    _run_import(client, src)
+    files = sorted((Path(client.state.cfg.root_path) / "audio").rglob("*.wav"))
+    stamp = os.stat(files[0]).st_mtime_ns
+
+    time.sleep(0.01)
+    snap = _run_import(client, src)
+    assert snap["result"]["audio_kept"] == 0, "默认应重写"
+    assert os.stat(files[0]).st_mtime_ns != stamp
+
+
+def test_import_rejects_unknown_audio_mode(client, tmp_path):
+    src = _seed_dataset(tmp_path)
+    r = client.post("/api/import", json={
+        "kind": "csemotions", "path": str(src), "audio_mode": "nonsense",
+    })
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- 人工标注（PATCH）
+
+def _first_id(client) -> int:
+    return client.post(
+        "/api/search", json={"use": "indextts", "top_k": 1}
+    ).json()["items"][0]["id"]
+
+
+def test_patch_language_is_editable(client, tmp_path):
+    """语种必须能通过 PATCH 改：导入时没标的素材只能靠这里补。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    assert client.get(f"/api/clips/{cid}").json()["language"] is None
+
+    data = client.patch(f"/api/clips/{cid}", json={"language": "zh"}).json()
+    assert data["language"] == "zh"
+    assert "language" in data["annotated_fields"].split(",")
+
+
+def test_patch_null_clears_annotation(client, tmp_path):
+    """显式传 null = 撤销该项人工标注，回落到程序值。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    original = client.get(f"/api/clips/{cid}").json()["category"]
+
+    client.patch(f"/api/clips/{cid}", json={"category": "我改的类别"})
+    assert client.get(f"/api/clips/{cid}").json()["category"] == "我改的类别"
+
+    data = client.patch(f"/api/clips/{cid}", json={"category": None}).json()
+    assert data["category"] == original
+    assert "category" not in data["annotated_fields"]
+
+
+def test_patch_returns_annotated_fields(client, tmp_path):
+    """前端靠 annotated_fields 显示「已手改」，且不产生 N+1 查询。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    assert client.get(f"/api/clips/{cid}").json()["annotated_fields"] == ""
+
+    client.patch(f"/api/clips/{cid}", json={"category": "甲", "notes": "乙"})
+    fields = client.get(f"/api/clips/{cid}").json()["annotated_fields"].split(",")
+    assert set(fields) == {"category", "notes"}, fields
+
+    # 检索结果里也要带，否则列表页无从判断
+    items = client.post(
+        "/api/search", json={"use": "indextts", "top_k": 50}
+    ).json()["items"]
+    hit = next(i for i in items if i["id"] == cid)
+    assert "annotated_fields" in hit
+
+
+def test_rebuilt_description_is_not_user_annotation(client, tmp_path):
+    """只改类别时描述由模板重建 —— 那份描述算程序值，不算用户标注。
+
+    否则以后重新导入永远刷不新这条的描述。
+    """
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+
+    data = client.patch(f"/api/clips/{cid}", json={"category": "自定义类别"}).json()
+    # 描述跟着重建（否则类别与描述会矛盾）
+    assert "自定义类别" in data["description"] or data["description"]
+    fields = data["annotated_fields"].split(",")
+    assert "category" in fields
+    assert "description" not in fields, "重建的描述不该被记成用户标注"
+
+
+def test_handwritten_description_is_user_annotation(client, tmp_path):
+    """用户手写的描述才算人工标注。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    data = client.patch(f"/api/clips/{cid}", json={"description": "我手写的"}).json()
+    assert "description" in data["annotated_fields"].split(",")
+
+
+# ---------------------------------------------------------------- 批量清空人工标注
+
+def test_clear_annotations_by_ids(client, tmp_path):
+    _run_import(client, _seed_dataset(tmp_path))
+    ids = [i["id"] for i in client.post(
+        "/api/search", json={"use": "indextts", "top_k": 3}
+    ).json()["items"]]
+    for cid in ids:
+        client.patch(f"/api/clips/{cid}", json={"category": "甲", "language": "zh"})
+
+    r = client.post("/api/annotations/clear", json={"clip_ids": ids[:2]})
+    assert r.status_code == 200
+    assert r.json()["cleared"] == 4          # 两条 × 两个字段
+    assert client.get(f"/api/clips/{ids[0]}").json()["annotated_fields"] == ""
+    assert client.get(f"/api/clips/{ids[2]}").json()["annotated_fields"] != ""
+
+
+def test_clear_annotations_requires_explicit_target(client, tmp_path):
+    """空 body 不能当成「条件全不限」而清光全库。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    client.patch(f"/api/clips/{cid}", json={"category": "甲"})
+
+    r = client.post("/api/annotations/clear", json={})
+    assert r.status_code == 400
+    assert client.get(f"/api/clips/{cid}").json()["annotated_fields"] != ""
+
+
+def test_clear_annotations_by_filter_covers_all_pages(client, tmp_path):
+    """按筛选清空必须覆盖整批，不受 top_k 限制。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    items = client.post(
+        "/api/search", json={"use": "indextts", "top_k": 50}
+    ).json()["items"]
+    assert len(items) == 12
+    for it in items:
+        client.patch(f"/api/clips/{it['id']}", json={"category": "甲"})
+
+    # 只传 by_filter 和一个窄条件：gender=female 共 6 条
+    r = client.post("/api/annotations/clear", json={
+        "by_filter": True, "use": "indextts", "gender": "female",
+    })
+    assert r.status_code == 200
+    assert r.json()["clips"] == 6
+    assert r.json()["cleared"] == 6
+
+    left = client.post("/api/search", json={"use": "indextts", "top_k": 50}).json()["items"]
+    females = [i for i in left if i["gender"] == "female"]
+    males = [i for i in left if i["gender"] == "male"]
+    assert all(i["annotated_fields"] == "" for i in females)
+    assert all(i["annotated_fields"] for i in males)
+
+
+def test_clear_annotations_filter_with_no_match(client, tmp_path):
+    """条件没命中时明确告知，而不是静默成功。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    r = client.post("/api/annotations/clear", json={
+        "by_filter": True, "use": "indextts", "gender": "female", "min_intensity": 5,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["clips"] == 0
+    assert "message" in data
+
+
+def test_clear_annotations_can_target_fields(client, tmp_path):
+    """只清指定字段：例如只撤销语种标注，保留手写描述。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    client.patch(f"/api/clips/{cid}", json={"language": "zh", "description": "我写的"})
+
+    r = client.post("/api/annotations/clear",
+                    json={"clip_ids": [cid], "fields": ["language"]})
+    assert r.json()["cleared"] == 1
+    data = client.get(f"/api/clips/{cid}").json()
+    assert data["language"] is None
+    assert data["description"] == "我写的"
+    assert data["annotated_fields"] == "description"
+
+
+def test_clear_annotations_restores_description(client, tmp_path):
+    """清掉语种标注后，描述里的「语言为中文」也应消失（否则自相矛盾）。"""
+    _run_import(client, _seed_dataset(tmp_path))
+    cid = _first_id(client)
+    client.patch(f"/api/clips/{cid}", json={"language": "zh"})
+    assert "语言为中文" in client.get(f"/api/clips/{cid}").json()["description"]
+
+    client.post("/api/annotations/clear", json={"clip_ids": [cid]})
+    data = client.get(f"/api/clips/{cid}").json()
+    assert "语言为中文" not in data["description"]
+    assert data["language"] is None

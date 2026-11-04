@@ -51,6 +51,28 @@ def test_guess_kind_detects_csemotions(fake_csemotions):
     assert guess_kind(fake_csemotions) == "csemotions"
 
 
+def test_guess_kind_flat_root_audio_is_not_emogator(tmp_path):
+    """平铺在根目录的音频应识别为 flat，而不是 emogator。
+
+    EmoGator 的形态是 `<label>/*.mp3`；根级平铺没有 label 子目录，
+    类别无从推断，强行当 emogator 会让类别变成文件名。
+    """
+    root = tmp_path / "flat"
+    root.mkdir()
+    for i in range(2):
+        _write(root / f"{i}.wav", synth_burst(1.2, seed=i))
+    assert guess_kind(root) == "flat"
+
+
+def test_guess_kind_label_subdirs_are_emogator(tmp_path):
+    root = tmp_path / "bursts"
+    for label in ("laugh", "cry"):
+        d = root / label
+        d.mkdir(parents=True)
+        _write(d / "0.wav", synth_burst(1.2))
+    assert guess_kind(root) == "emogator"
+
+
 def test_iter_csemotions_reads_speaker_and_emotion(fake_csemotions):
     items = list(iter_csemotions(fake_csemotions, {"S03": "male", "S07": "female"}))
     assert len(items) == 12 + 2
@@ -74,10 +96,11 @@ def test_import_csemotions_end_to_end(fake_csemotions, tmp_lib):
     progress_calls: list[tuple[int, int]] = []
     res = import_into(cfg, db, enc, opts, progress=lambda d, t: progress_calls.append((d, t)))
 
-    assert res.imported == 12
-    assert res.skipped_short == 1
+    assert res.imported == 13            # 12 条正常 + 1 条 2s（不再丢弃）
+    assert res.imported_short == 1       # 那条 2s 的：入库但标了 notes
+    assert res.skipped_short == 0        # 过短不再算「跳过」
     assert res.skipped_silent == 1
-    assert db.count() == 12
+    assert db.count() == 13
     assert progress_calls and progress_calls[-1][0] == progress_calls[-1][1]
 
     rows = db.iter_clips()
@@ -94,10 +117,19 @@ def test_import_csemotions_end_to_end(fake_csemotions, tmp_lib):
         assert row["target_use"] == "indextts"
         # 许可推导
         assert row["commercial_ok"] == 1
-        assert 3.0 <= row["duration_sec"] <= 15.0
         # 只记增益，不改音频电平
         assert row["gain_db"] is not None
         assert row["loudness_lufs"] is not None
+        # 时长范围：过短的也入库（标 notes），所以这里只校验上限；
+        # 下限由那些没有被标「低于」的条目各自保证。
+        assert row["duration_sec"] <= 15.0
+        if row["duration_sec"] < 3.0:
+            assert row["notes"] and "低于" in row["notes"], row["filepath"]
+
+    # 那条 2 秒的必须保留下来，并带上下限提示
+    short_rows = [r for r in rows if r["duration_sec"] < 3.0]
+    assert len(short_rows) == 1
+    assert "低于 3s 下限" in (short_rows[0]["notes"] or "")
 
     angry = [r for r in rows if r["category"] == "Angry"]
     assert angry and "愤怒" in angry[0]["description"]
@@ -228,7 +260,12 @@ def test_flat_manifest_import(tmp_path, tmp_lib):
     assert "强烈" in rows["laugh"]["description"]
 
 
-def test_long_burst_is_skipped(tmp_lib, tmp_path):
+def test_long_burst_is_imported_with_note(tmp_lib, tmp_path):
+    """超长素材入库而不是丢弃，并在 notes 里标明需人工截取。
+
+    旧行为是直接丢弃（skipped_long += 1）。实测 CSEMOTIONS 有 8.5% 的素材
+    超过 IndexTTS 的 15 秒上限，静默丢掉等于白白损失可用素材。
+    """
     src = tmp_path / "long"
     src.mkdir()
     sr = 22050
@@ -239,8 +276,16 @@ def test_long_burst_is_skipped(tmp_lib, tmp_path):
     db = Database(cfg.db_path)
     opts = ImportOptions(kind="flat", path=str(src), target_use="seedvc")
     res = import_into(cfg, db, HashingEncoder(), opts)
-    assert res.skipped_long == 1
-    assert res.imported == 0
+
+    assert res.imported == 1
+    assert res.imported_over_long == 1
+    assert res.skipped_long == 0
+
+    row = db.iter_clips()[0]
+    assert row["duration_sec"] > 5.0
+    assert row["notes"], "超长素材必须写 notes"
+    assert "超出" in row["notes"]
+    assert "截取" in row["notes"]
 
 
 def test_multi_burst_flagged_in_notes(tmp_lib, tmp_path):
@@ -285,3 +330,248 @@ def test_trim_preserves_low_level_tail_through_ingest(tmp_lib, tmp_path):
     assert row["duration_sec"] > 2.8, (
         f"入库后只剩 {row['duration_sec']}s（trim30 为 {trim30:.2f}s），低电平尾部被误切"
     )
+
+
+# ---------------------------------------------------------------- 混合目录自动拆分
+
+
+@pytest.fixture
+def mixed_root(tmp_path: Path) -> Path:
+    """一个根目录里同时有三种排布。"""
+    root = tmp_path / "mixed"
+    for spk in ("S01", "S02"):
+        for emo in ("Angry", "Sad"):
+            d = root / "CSEMOTIONS" / spk / emo
+            d.mkdir(parents=True)
+            for i in range(2):
+                _write(d / f"{i}.wav", synth_speech(6.0, seed=i))
+    for lab in ("laugh", "cry"):
+        d = root / "EmoGator" / lab
+        d.mkdir(parents=True)
+        for i in range(2):
+            _write(d / f"{i}.wav", synth_burst(1.5, seed=i))
+    d = root / "custom"
+    d.mkdir()
+    for i in range(2):
+        _write(d / f"{i}.wav", synth_burst(1.2, seed=i))
+    return root
+
+
+def test_plan_import_splits_mixed_root(mixed_root):
+    """混合根目录必须拆成多个单元，各按正确排布解读。
+
+    回归点：旧实现把整个根判成 emogator，于是 CSEMOTIONS 那部分
+    的类别会变成说话人名（S01/S02），语义全错。
+    """
+    from voicelib.sources import plan_import
+
+    plans = {p.label: p for p in plan_import(mixed_root)}
+    assert set(plans) == {"CSEMOTIONS", "EmoGator", "custom"}
+
+    assert plans["CSEMOTIONS"].kind == "csemotions"
+    assert plans["CSEMOTIONS"].clip_kind == "speech"
+    assert plans["CSEMOTIONS"].target_use == "indextts"
+    assert plans["CSEMOTIONS"].count == 8
+
+    assert plans["EmoGator"].kind == "emogator"
+    assert plans["EmoGator"].clip_kind == "vocal_burst"
+    assert plans["EmoGator"].target_use == "seedvc"
+    assert plans["EmoGator"].count == 4
+
+    assert plans["custom"].kind == "flat"
+
+
+def test_import_auto_handles_mixed_root(mixed_root, tmp_lib):
+    """auto 模式一次导完混合目录，两种线路各自正确。"""
+    from voicelib.ingest import import_into
+
+    cfg = Config(root=str(tmp_lib))
+    cfg.ensure_dirs()
+    db = Database(cfg.db_path)
+    res = import_into(
+        cfg, db, HashingEncoder(),
+        ImportOptions(kind="auto", path=str(mixed_root), license="apache-2.0"),
+    )
+    assert res.imported == 14
+    assert res.units, "应当有单元明细"
+
+    rows = db.iter_clips()
+    speech = [r for r in rows if r["clip_kind"] == "speech"]
+    burst = [r for r in rows if r["clip_kind"] == "vocal_burst"]
+    # CSEMOTIONS 8 条 → speech；EmoGator 4 条 + custom 2 条（1.2 秒，推断为 SeedVC）→ vocal_burst
+    assert len(speech) == 8
+    assert len(burst) == 6
+
+    # 关键：说话片段的类别必须是情绪，不能是说话人名
+    assert {r["category"] for r in speech} == {"Angry", "Sad"}
+    assert "S01" not in {r["category"] for r in rows}
+    assert "S02" not in {r["category"] for r in rows}
+
+    # 各自落到对应目录、对应线路
+    for r in speech:
+        assert r["target_use"] == "indextts"
+        assert r["filepath"].startswith("audio/csemotions/")
+    for r in burst:
+        assert r["target_use"] == "seedvc"
+        assert r["filepath"].startswith("audio/vocal_burst/")
+
+
+def test_import_auto_on_single_type_dir(mixed_root, tmp_lib):
+    """单类型目录在 auto 下仍只有一个单元，行为与显式指定一致。"""
+    from voicelib.ingest import import_into
+
+    cfg = Config(root=str(tmp_lib))
+    cfg.ensure_dirs()
+    db = Database(cfg.db_path)
+    res = import_into(
+        cfg, db, HashingEncoder(),
+        ImportOptions(kind="auto", path=str(mixed_root / "CSEMOTIONS")),
+    )
+    assert len(res.units) == 1
+    assert res.imported == 8
+    assert all(r["clip_kind"] == "speech" for r in db.iter_clips())
+
+
+def test_import_auto_empty_dir_raises(tmp_path, tmp_lib):
+    from voicelib.ingest import import_into
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cfg = Config(root=str(tmp_lib))
+    cfg.ensure_dirs()
+    with pytest.raises(ValueError):
+        import_into(cfg, Database(cfg.db_path), HashingEncoder(),
+                    ImportOptions(kind="auto", path=str(empty)))
+
+
+def test_reimport_overwrites_program_values_but_keeps_user_annotations(fake_csemotions, tmp_lib):
+    """用户要求：重复导入覆盖**程序标注**，但不动**用户标注**。
+
+    旧实现靠 HUMAN_FIELDS 白名单保住 clips 里的四个字段，
+    结果那些字段的程序值永远刷不新。现在人工值在 annotations 表：
+      * clips 的每一列都应被新导入刷新
+      * annotations 一行都不该动
+    """
+    cfg = _cfg(tmp_lib)
+    db = Database(cfg.db_path)
+    enc = HashingEncoder()
+    opts = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts)
+    clip_id = db.iter_clips()[0]["id"]
+    program_before = db.get_clip(clip_id)["description"]
+
+    db.update_clip(clip_id, {"description": "我写的描述", "verified": 1})
+
+    # 再导一次，但用不同的 license，让 clips 那一列必然变化
+    opts2 = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        license="cc-by-4.0",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts2)
+
+    with db.read() as conn:
+        raw = conn.execute(
+            "SELECT description, verified, license FROM clips WHERE id = ?", (clip_id,)
+        ).fetchone()
+    # 程序标注被覆盖：clips 里回到模板生成的描述，license 也换新了
+    assert raw["description"] == program_before
+    assert raw["description"] != "我写的描述"
+    assert raw["license"] == "cc-by-4.0"
+    assert raw["verified"] == 0        # 程序值，不是人工的 1
+
+    # 用户标注完好：读取层仍给人看人工值
+    row = db.get_clip(clip_id)
+    assert row["description"] == "我写的描述"
+    assert row["verified"] == 1
+    assert db.annotations_of(clip_id) == {"description": "我写的描述", "verified": "1"}
+
+
+# ---------------------------------------------------------------- 音频落盘策略
+#
+# 用户要求：设置项支持「覆盖导入音频」或「继续用库里已有的音频文件」。
+# 注意与 overwrite 参数区分：那个管的是「遇到同 filepath 的记录要不要跳过」，
+# 这个管的是「磁盘上的 wav 要不要重写」。
+
+
+def _first_audio(cfg) -> Path:
+    files = sorted((cfg.root_path / "audio").rglob("*.wav"))
+    assert files, "导入后应当有音频文件"
+    return files[0]
+
+
+def test_audio_mode_overwrite_rewrites_file(fake_csemotions, tmp_lib):
+    """默认 overwrite：同名文件被重写（mtime 变化）。"""
+    import os, time
+
+    cfg = _cfg(tmp_lib)
+    db = Database(cfg.db_path)
+    enc = HashingEncoder()
+    opts = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts)
+    target = _first_audio(cfg)
+    stamp = os.stat(target).st_mtime_ns
+
+    time.sleep(0.01)
+    import_into(cfg, db, enc, opts)
+    assert os.stat(target).st_mtime_ns != stamp, "overwrite 模式应重写文件"
+
+
+def test_audio_mode_keep_leaves_existing_file(fake_csemotions, tmp_lib):
+    """keep：文件已在就不写盘，元数据照常刷新。"""
+    import os, time
+
+    cfg = _cfg(tmp_lib)
+    db = Database(cfg.db_path)
+    enc = HashingEncoder()
+    opts = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts)
+    target = _first_audio(cfg)
+    stamp = os.stat(target).st_mtime_ns
+    before = db.count()
+
+    time.sleep(0.01)
+    opts2 = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        audio_mode="keep",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    result = import_into(cfg, db, enc, opts2)
+
+    assert os.stat(target).st_mtime_ns == stamp, "keep 模式不应重写文件"
+    assert result.audio_kept > 0, "结果里应能看到「保留了多少条音频」"
+    assert db.count() == before, "记录数不变"
+
+
+def test_audio_mode_keep_still_writes_missing_file(fake_csemotions, tmp_lib):
+    """keep 但文件不存在时必须补写：否则记录指向空路径，试听会 404。"""
+    import os
+
+    cfg = _cfg(tmp_lib)
+    db = Database(cfg.db_path)
+    enc = HashingEncoder()
+    opts = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts)
+    target = _first_audio(cfg)
+    os.remove(target)
+    assert not target.exists()
+
+    opts2 = ImportOptions(
+        kind="csemotions", path=str(fake_csemotions), target_use="indextts",
+        audio_mode="keep",
+        gender_map={"S03": "male", "S07": "female"},
+    )
+    import_into(cfg, db, enc, opts2)
+    assert target.is_file(), "文件缺失时 keep 模式必须补写"

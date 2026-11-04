@@ -32,6 +32,36 @@ const stars = computed(() => {
 
 const isSpeech = computed(() => props.clip.clip_kind === 'speech')
 
+// 哪些字段被人工改过（后端 clips_merged 的 annotated_fields，逗号分隔）。
+// 空串 = 全是程序标注。
+const annotated = computed(() =>
+  String(props.clip.annotated_fields || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+)
+
+const FIELD_CN = {
+  category: '类别',
+  gender: '性别',
+  language: '语种',
+  transcript: '台词',
+  description: '描述',
+  notes: '备注',
+  license: '许可',
+  intensity: '强度',
+  verified: '已验证',
+  has_background: '背景音',
+  studio_quality: '录音质量',
+  commercial_ok: '商用',
+}
+
+const annotatedTitle = computed(() =>
+  annotated.value.length
+    ? `人工标注：${annotated.value.map((f) => FIELD_CN[f] || f).join('、')}`
+    : '',
+)
+
 function toggleSelect() {
   emit('select', props.clip.id, !props.selected)
 }
@@ -98,6 +128,11 @@ function cancelEdit() {
         >✓</button>
         <span v-if="clip.commercial_ok" class="tag ok" title="可商用">商用</span>
         <span v-else class="tag nc" :title="`许可：${clip.license}`">非商用</span>
+        <span
+          v-if="annotated.length"
+          class="tag manual"
+          :title="annotatedTitle"
+        >已手改 {{ annotated.length }}</span>
         <span v-if="clip.score" class="score" :title="'语义相似度'">
           {{ clip.score.toFixed(3) }}
         </span>
@@ -229,6 +264,14 @@ function cancelEdit() {
 .tag.nc {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+}
+/* 「已手改 N」：与「商用」等程序标签区分开，用强调色实心块，
+   让用户一眼能看出这条被人工动过、重新导入也不会被覆盖。 */
+.tag.manual {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  cursor: help;
 }
 .score {
   margin-left: auto;

@@ -12,6 +12,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .db import Database
+from . import tags as T
 
 # §3.3 两条线路的必要约束
 USAGE_RULES: dict[str, dict[str, Any]] = {
@@ -79,6 +80,89 @@ def _quality_key(r: Any) -> tuple:
     return (int(studio or 0), int(verified or 0), int(intensity or 0), int(commercial or 0))
 
 
+def build_filter_clause(
+    *,
+    use: str = "indextts",
+    kinds: list[str] | None = None,
+    categories: list[str] | None = None,
+    gender: str | None = None,
+    min_intensity: int | None = None,
+    duration: tuple[float, float] | None = None,
+    commercial_only: bool = False,
+    verified_only: bool = False,
+    language: str | None = None,
+) -> tuple[str, list[Any]]:
+    """L1 结构化条件的唯一来源，返回 (WHERE 之后的片段, 参数)。
+
+    抽出来是因为「按当前筛选条件清空人工标注」必须与检索**用同一套条件**：
+    两处各写一份，早晚会漂移，出现「界面筛出 30 条，却清掉另外 200 条」。
+
+    注意 `use` 会带进 `target_use IN (?, 'both')`；
+    传 'all' 的调用方由 server 层先归一成具体线路。
+    """
+    cond = "target_use IN (?, 'both')"
+    params: list[Any] = [use]
+
+    if kinds:
+        cond += " AND clip_kind IN ({})".format(",".join("?" * len(kinds)))
+        params += list(kinds)
+    if verified_only:
+        cond += " AND verified = 1"
+    if commercial_only:
+        cond += " AND commercial_ok = 1"
+    if categories:
+        cond += " AND category IN ({})".format(",".join("?" * len(categories)))
+        params += list(categories)
+    if gender:
+        cond += " AND gender = ?"
+        params.append(gender)
+    if language is not None:
+        # 空串是前端「未标注」选项的取值：SQL 里 NULL != '' 永远不成立，
+        # 必须显式拼 IS NULL，否则「未标注」会筛出 0 条。
+        if language == "":
+            cond += " AND language IS NULL"
+        else:
+            cond += " AND language = ?"
+            params.append(language)
+    if min_intensity is not None:
+        cond += " AND intensity >= ?"
+        params.append(int(min_intensity))
+    if duration:
+        cond += " AND duration_sec BETWEEN ? AND ?"
+        params += [float(duration[0]), float(duration[1])]
+    return cond, params
+
+
+def ids_matching(
+    db: Database,
+    *,
+    use: str = "indextts",
+    kinds: list[str] | None = None,
+    categories: list[str] | None = None,
+    gender: str | None = None,
+    min_intensity: int | None = None,
+    duration: tuple[float, float] | None = None,
+    commercial_only: bool = False,
+    verified_only: bool = False,
+    language: str | None = None,
+) -> list[int]:
+    """当前筛选条件下的全部 id（**不受 top_k 限制**）。
+
+    用于「按筛选条件批量清空标注」：界面只显示一页，但要清的是整批。
+    """
+    cond, params = build_filter_clause(
+        use=use, kinds=kinds, categories=categories, gender=gender,
+        min_intensity=min_intensity, duration=duration,
+        commercial_only=commercial_only, verified_only=verified_only,
+        language=language,
+    )
+    with db.read() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM clips_merged WHERE {cond}", params
+        ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
 def search(
     db: Database,
     encoder,
@@ -95,6 +179,7 @@ def search(
     top_k: int = 20,
     sort: str = "relevance",
     offset: int = 0,
+    # 语种过滤：None = 不限；"" = 只要未标注（NULL）的；其余按值精确匹配
     language: str | None = None,
 ) -> tuple[int, list[tuple[float, Any]]]:
     """返回 (命中总数, [(score, row), ...])。
@@ -102,37 +187,22 @@ def search(
     rows 含 embedding 列，调用方负责剥离后返回给前端。
     """
     # ---- L1 结构化过滤 ----
+    # 查 clips_merged（用户标注优先），不是 clips。
+    # 若筛选查程序值而响应里给用户值，用户按某值筛出来的条目
+    # 会显示成另一个值，自相矛盾。
+    cond, params = build_filter_clause(
+        use=use, kinds=kinds, categories=categories, gender=gender,
+        min_intensity=min_intensity, duration=duration,
+        commercial_only=commercial_only, verified_only=verified_only,
+        language=language,
+    )
     sql = (
         "SELECT id, filepath, description, embedding, category, intensity, gender, "
         "duration_sec, speaker_id, target_use, clip_kind, verified, commercial_ok, "
         "license, transcript, gain_db, loudness_lufs, language, studio_quality, "
-        "has_background, notes, sample_rate, source_file, start_sec "
-        "FROM clips WHERE target_use IN (?, 'both')"
+        "has_background, notes, sample_rate, source_file, start_sec, annotated_fields "
+        f"FROM clips_merged WHERE {cond}"
     )
-    params: list[Any] = [use]
-
-    if kinds:
-        sql += " AND clip_kind IN ({})".format(",".join("?" * len(kinds)))
-        params += list(kinds)
-    if verified_only:
-        sql += " AND verified = 1"
-    if commercial_only:
-        sql += " AND commercial_ok = 1"
-    if categories:
-        sql += " AND category IN ({})".format(",".join("?" * len(categories)))
-        params += list(categories)
-    if gender:
-        sql += " AND gender = ?"
-        params.append(gender)
-    if language:
-        sql += " AND language = ?"
-        params.append(language)
-    if min_intensity is not None:
-        sql += " AND intensity >= ?"
-        params.append(int(min_intensity))
-    if duration:
-        sql += " AND duration_sec BETWEEN ? AND ?"
-        params += [float(duration[0]), float(duration[1])]
 
     with db.read() as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -190,19 +260,63 @@ def search_for(db: Database, encoder, use: str, *, q: str | None = None, top_k: 
 
 
 def categories_for(use: str, db: Database | None = None) -> list[dict[str, Any]]:
-    """某条线路下可用的类别（带计数），供前端筛选面板。"""
+    """某条线路下可用的类别（带计数），供前端筛选面板。
+
+    同时返回两套名字：
+      * `category`    —— 库里的原始标签（Adoration / cough），用于筛选时精确匹配
+      * `category_cn` —— 中文显示名（倾慕 / 咳嗽），只用于界面
+
+    为什么不在存储层直接存中文：原始标签是数据集的一部分，
+    改掉就再也无法按 `Adoration` 精确回溯。中文映射是**展示用**的，
+    而且映射表会随数据集扩充，放在读取层才能随时调整。
+    """
     rule = USAGE_RULES.get(use)
     if db is None or rule is None:
         return []
     kinds = rule["kinds"]
     sql = (
-        "SELECT category, COUNT(*) AS n FROM clips "
+        "SELECT category, COUNT(*) AS n FROM clips_merged "
         "WHERE target_use IN (?, 'both') AND clip_kind IN ({}) "
         "GROUP BY category ORDER BY n DESC"
     ).format(",".join("?" * len(kinds)))
     with db.read() as conn:
         rows = conn.execute(sql, [use, *kinds]).fetchall()
-    return [{"category": r["category"], "count": r["n"]} for r in rows]
+    # 副语言走 burst 映射，说话片段走 emotion 映射；
+    # 两套表都覆盖不到时回退成原值（category_cn == category）。
+    to_cn = T.burst_kind_cn if "vocal_burst" in kinds else T.emotion_cn
+    return [
+        {"category": r["category"], "category_cn": to_cn(r["category"]), "count": r["n"]}
+        for r in rows
+    ]
+
+
+def languages_for(use: str, db: Database | None = None) -> list[dict[str, Any]]:
+    """某条线路下出现过的语种（带计数），供筛选面板。
+
+    与 `categories_for` 同一套口径（该线路的 clip_kind 内），
+    同样返回原值 + 中文名：`language` / `language_cn`。
+    NULL 归一成空串，前端据此给出「未标注」按钮，`language=""` 传回
+    检索层时会被翻译成 `IS NULL`。
+    """
+    rule = USAGE_RULES.get(use)
+    if db is None or rule is None:
+        return []
+    kinds = rule["kinds"]
+    sql = (
+        "SELECT language, COUNT(*) AS n FROM clips_merged "
+        "WHERE target_use IN (?, 'both') AND clip_kind IN ({}) "
+        "GROUP BY language ORDER BY n DESC"
+    ).format(",".join("?" * len(kinds)))
+    with db.read() as conn:
+        rows = conn.execute(sql, [use, *kinds]).fetchall()
+    return [
+        {
+            "language": r["language"] or "",
+            "language_cn": T.language_cn(r["language"]),
+            "count": r["n"],
+        }
+        for r in rows
+    ]
 
 
 def row_to_dict(row: Any, *, score: float = 0.0, keep_embedding: bool = False) -> dict[str, Any]:

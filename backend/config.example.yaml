@@ -15,7 +15,7 @@ indextts_duration: [3.0, 15.0]
 seedvc_duration: [0.3, 5.0]
 
 # 预置的数据源目录，导入页会列出来。
-# kind: csemotions | emogator | flat
+# kind: csemotions | emogator | flat | parquet
 scan_roots:
   - kind: csemotions
     path: /data/CSEMOTIONS

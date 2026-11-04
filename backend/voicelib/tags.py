@@ -15,11 +15,23 @@ from typing import Any
 
 
 def commercial_ok_of(license_str: str | None) -> int:
-    """CC-BY-NC / NC / non-commercial → 0，其余 → 1。"""
-    s = (license_str or "").lower()
+    """由许可推导是否可商用（方案 §4.5）。
+
+    只有**明确的可商用许可**才返回 1。以下一律 0：
+      * 空值 / None
+      * 含 NC / NonCommercial 条款
+      * 未知（unknown / unspecified / 无法识别）
+
+    最后一条是刻意的保守：许可不明确时按不可商用处理，
+    避免把 NC 素材误标成可商用。代价是需要用户核对后手动改。
+    """
+    s = (license_str or "").strip().lower()
     if not s:
         return 0
     if "nc" in s or "noncommercial" in s or "non-commercial" in s:
+        return 0
+    # 明确的"未知"类取值：不猜，按不可商用
+    if s in ("unknown", "unspecified", "unclear", "n/a", "na", "none", "other"):
         return 0
     return 1
 
@@ -58,6 +70,32 @@ SPEECH_EMOTION_CN: dict[str, str] = {
     "disgust": "厌恶",
     "disgusted": "厌恶",
     "melancholic": "忧郁",
+    # ---- Expresso 的 style 类（走 speech 模板，必须翻成中文）----
+    # 这些是说话风格而非情绪，但描述模板同一套，翻译口径保持一致。
+    "laughing": "大笑",
+    "whisper": "低语",
+    "confused": "困惑",
+    "enunciated": "吐字清晰",
+    "default": "自然",
+    "default_emphasis": "强调语气",
+    "default_essentials": "基础语气",
+    "nonverbal": "非语言",
+    "fast": "快速",
+    "projected": "高声",
+    "sympathetic": "同情",
+    "sarcastic": "讽刺",
+    "narration": "叙述",
+    "animal": "动物声",
+    "animaldir": "动物声",
+    "awe": "敬畏",
+    "desire": "渴望",
+    "bored": "厌倦",
+    "child": "童声",
+    "childdir": "童声",
+    "singing": "歌唱",
+    "sleepy": "困倦",
+    "default_longform": "长文自然",
+    "narration_longform": "长文叙述",
 }
 
 # EmoGator 30 类 → IndexTTS 8 维（§3.6 的有损映射，仅作参考/过滤别名）
@@ -105,6 +143,8 @@ BURST_KIND_CN: dict[str, str] = {
     "screaming": "尖叫",
     "sniff": "抽鼻子",
     "sneeze": "喷嚏",
+    # sneeze → sneezing 去掉了词尾 e，子串匹配不到，必须单列
+    "sneezing": "喷嚏",
     "yawn": "哈欠",
     "groan": "呻吟",
     "moan": "呻吟",
@@ -121,6 +161,53 @@ BURST_KIND_CN: dict[str, str] = {
     "pant": "喘气",
     "hiss": "嘶声",
     "yell": "喊叫",
+    # ---- EmoGator 30 类（GoEmotions 本体，被当作发声的情绪标签）----
+    # 注意 burst_kind_cn 有子串匹配兜底（`if k in key`），
+    # 所以这里只放完整词，带括号的放在对应短词前面更稳妥。
+    "surprise (positive)": "惊喜",
+    "surprise (negative)": "惊愕",
+    "romantic love": "爱意",
+    "adoration": "倾慕",
+    "anger": "愤怒",
+    "disappointment": "失望",
+    "guilt": "内疚",
+    "interest": "兴趣",
+    "pride": "自豪",
+    "serenity": "安宁",
+    "sympathy": "同情",
+    "awe": "敬畏",
+    "confusion": "困惑",
+    "desire": "渴望",
+    "disgust": "厌恶",
+    "neutral": "平静",
+    "realization": "领悟",
+    "shame": "羞愧",
+    "triumph": "得意",
+    "amusement": "愉悦",
+    "contentment": "满足",
+    "distress": "痛苦",
+    "ecstasy": "狂喜",
+    "fear": "恐惧",
+    "pain": "疼痛",
+    "relief": "宽慰",
+    "sadness": "悲伤",
+    "contempt": "轻蔑",
+    "elation": "兴奋",
+    "embarrassment": "尴尬",
+    # ---- VIVAE 6 类（与上面重叠的已覆盖，这里补差异项）----
+    "pleasure": "愉悦",
+    "surprise": "惊讶",
+    "achievement": "成就感",
+    # ---- VocalSound / DeeplyNonverbalVocalization 的多词标签 ----
+    # 现有表里是 "throat_clear"（下划线），而这两个子集用空格，
+    # 子串匹配对不上，必须单独加。
+    "throat clearing": "清嗓",
+    "lip popping": "弹唇",
+    "nose blowing": "擤鼻",
+    "tongue clicking": "弹舌",
+    "teeth chattering": "牙齿打颤",
+    "lip smacking": "咂嘴",
+    "teeth grinding": "磨牙",
 }
 
 # 词边界模糊匹配用的中文别名（正则里统一处理大小写）
@@ -171,6 +258,33 @@ def burst_kind_cn(label: str | None) -> str:
 # ---------------------------------------------------------------- 性别
 
 GENDER_CN = {"male": "男", "female": "女", "m": "男", "f": "女", "男": "男", "女": "女"}
+
+# ---------------------------------------------------------------- 语种
+#
+# 显示层翻译，和类别同理：库里存 BCP-47 风格的码（`en` / `zh`），
+# 界面上给中文名。映射不到的码原样显示，不留空。
+LANGUAGE_CN: dict[str, str] = {
+    "zh": "中文",
+    "en": "英文",
+    "ja": "日语",
+    "ko": "韩语",
+    "fr": "法语",
+    "de": "德语",
+    "es": "西班牙语",
+    "ru": "俄语",
+}
+
+
+def language_cn(code: str | None) -> str:
+    if not code:
+        return "未标注"
+    key = str(code).strip().lower()
+    if key in LANGUAGE_CN:
+        return LANGUAGE_CN[key]
+    base = key.split("-")[0]  # zh-CN → zh
+    if base in LANGUAGE_CN:
+        return LANGUAGE_CN[base]
+    return str(code)
 
 
 def normalize_gender(g: str | None) -> str | None:

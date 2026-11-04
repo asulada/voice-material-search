@@ -8,6 +8,12 @@ setlocal
 cd /d "%~dp0backend" || (echo 找不到 backend 目录 & pause & exit /b 1)
 
 if "%PY%"=="" set PY=py
+
+rem 优先级：用户显式设置的 PY > 当前激活的 conda 环境 > virtualenv > py 默认。
+rem 注意：Windows 的 py launcher 只认 VIRTUAL_ENV，**不认 CONDA_PREFIX**，
+rem 所以 conda 环境下必须显式指向 %CONDA_PREFIX%\python.exe，否则会跑到 base 环境。
+if "%PY%"=="py" if defined CONDA_PREFIX if exist "%CONDA_PREFIX%\python.exe" set PY=%CONDA_PREFIX%\python.exe
+
 if "%PORT%"=="" set PORT=8000
 
 rem 让 Python 的输入输出也用 UTF-8，避免 uvicorn 中文日志报 UnicodeEncodeError

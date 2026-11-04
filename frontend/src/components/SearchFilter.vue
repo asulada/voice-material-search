@@ -8,6 +8,7 @@ import { computed, ref, watch } from 'vue'
 const props = defineProps({
   uses: { type: Array, default: () => [] },
   categories: { type: Array, default: () => [] },
+  languages: { type: Array, default: () => [] },
   modelValue: { type: Object, required: true },
   busy: { type: Boolean, default: false },
 })
@@ -23,6 +24,10 @@ watch(
   { deep: true },
 )
 
+// 类别关键词：中文名与英文原名都参与匹配（Adoration / 倾慕 输哪个都能找到）。
+// 已勾选的类别始终保留显示，否则过滤后用户看不到自己选了什么。
+const catQuery = ref('')
+
 // 线路切换：必须由 local.use 的变化驱动（父级不会先改）。
 // 之前监听 props.modelValue.use 是错的——点击按钮只改 local，
 // 父级的 use 没变，watch 不触发，于是检索仍在旧线路上跑。
@@ -32,6 +37,8 @@ watch(
     if (!prev || use === prev) return
     const rule = props.uses.find((u) => u.value === use)
     local.value.categories = []
+    local.value.language = null // 语种分布是按线路统计的，换线后旧值可能不存在
+    catQuery.value = '' // 旧线路搜过的类别词留着，新线路会误显示「没有匹配的类别」
     if (rule) {
       local.value.duration = [...rule.duration]
     }
@@ -41,29 +48,48 @@ watch(
 
 const currentRule = computed(() => props.uses.find((u) => u.value === local.value.use))
 
+const filteredCategories = computed(() => {
+  const k = catQuery.value.trim().toLowerCase()
+  const selected = local.value.categories || []
+  const all = props.categories || []
+  if (!k) return all
+  return all.filter(
+    (c) =>
+      selected.includes(c.category) ||
+      [c.category, c.category_cn].some((x) => String(x || '').toLowerCase().includes(k)),
+  )
+})
+
 function push() {
   emit('update:modelValue', { ...local.value })
 }
 
+/**
+ * 类别单选：点新的类别直接替换，再点已选中的取消（= 不限）。
+ *
+ * 为什么不是多选：类别之间基本互斥（愤怒 / 悲伤 / 笑声），
+ * 多选时用户很难判断「选了 3 个类别」到底想看什么；
+ * 而且类别一多，多选的勾选状态在窄面板里根本看不清。
+ * 需要跨类别时用「全库」或描述检索。
+ */
 function toggleCategory(cat) {
-  const list = local.value.categories || []
-  local.value.categories = list.includes(cat)
-    ? list.filter((c) => c !== cat)
-    : [...list, cat]
+  const current = local.value.categories || []
+  local.value.categories = current.includes(cat) ? [] : [cat]
   push()
 }
 
 function submit() {
   emit('search')
 }
-
 function reset() {
   local.value.categories = []
   local.value.gender = null
+  local.value.language = null
   local.value.min_intensity = 0
   local.value.commercial_only = false
   local.value.verified_only = false
   local.value.q = ''
+  catQuery.value = ''
   local.value.duration = currentRule.value ? [...currentRule.value.duration] : null
   // 只发一次事件：父级据此覆盖 query 并检索一次。
   // 之前这里还 push() 了一次，于是重置会连发两次检索，列表闪两下。
@@ -73,6 +99,24 @@ function reset() {
 const totalCategoryCount = computed(() =>
   (props.categories || []).reduce((s, c) => s + c.count, 0),
 )
+
+/** 类别是单选，副标题直接显示选中的那个中文名，而不是「已选 1 项」 */
+const categoryLabel = computed(() => {
+  const picked = (local.value.categories || [])[0]
+  if (!picked) return '全部'
+  const hit = (props.categories || []).find((c) => c.category === picked)
+  return hit?.category_cn || picked
+})
+
+/** 「未标注」的取值是空串（后端会翻成 IS NULL），所以不能只用 !language 判空 */
+const isAnyLanguage = computed(
+  () => local.value.language === null || local.value.language === undefined,
+)
+const languageLabel = computed(() => {
+  if (isAnyLanguage.value) return '不限'
+  const hit = (props.languages || []).find((l) => l.language === local.value.language)
+  return hit?.language_cn || local.value.language || '未标注'
+})
 </script>
 
 <template>
@@ -115,21 +159,59 @@ const totalCategoryCount = computed(() =>
     <div class="block">
       <label class="lbl">
         类别
-        <span class="sub">{{ (local.categories || []).length || '全部' }}</span>
+        <span class="sub">{{ categoryLabel }}</span>
       </label>
+      <input
+        v-model="catQuery"
+        class="q"
+        type="search"
+        placeholder="搜类别：愤怒 / Angry"
+      />
       <div class="cats">
         <button
-          v-for="c in categories"
+          v-for="c in filteredCategories"
           :key="c.category"
           class="cat"
           :class="{ on: (local.categories || []).includes(c.category) }"
+          :title="c.category"
           @click="toggleCategory(c.category)"
         >
-          {{ c.category }}<span class="n">{{ c.count }}</span>
+          {{ c.category_cn || c.category }}<span class="n">{{ c.count }}</span>
         </button>
         <p v-if="!categories.length" class="empty">该线路暂无素材</p>
         <p v-else-if="!totalCategoryCount" class="empty">暂无</p>
+        <p v-else-if="!filteredCategories.length" class="empty">没有匹配的类别</p>
       </div>
+    </div>
+
+    <div class="block">
+      <label class="lbl">
+        语种
+        <span class="sub">{{ languageLabel }}</span>
+      </label>
+      <div class="cats">
+        <button
+          class="cat"
+          :class="{ on: isAnyLanguage }"
+          @click="local.language = null; push()"
+        >
+          不限
+        </button>
+        <button
+          v-for="l in languages"
+          :key="l.language || '_none'"
+          class="cat"
+          :class="{ on: local.language === l.language }"
+          :title="l.language || '库里没有标注语种的素材'"
+          @click="local.language = l.language; push()"
+        >
+          {{ l.language_cn || l.language }}<span class="n">{{ l.count }}</span>
+        </button>
+      </div>
+      <p v-if="local.language" class="help">
+        库里很多素材没标语种（导入时留空或副语言子集刻意不标）。
+        想找中文素材却没有「中文」按钮，说明那批素材还在「未标注」里。
+      </p>
     </div>
 
     <div class="block">

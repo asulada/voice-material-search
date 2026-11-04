@@ -3,7 +3,7 @@
  * 用 JSDoc 类型代替 TS，保持零构建复杂度。
  */
 
-/** @typedef {{id:number,filepath:string,audio_url:string,description:string,category:string,intensity:number|null,gender:string|null,duration_sec:number,gain_db:number|null,score:number,verified:number,commercial_ok:number,target_use:string,clip_kind:string,license:string,transcript:string|null,language:string|null,speaker_id:string|null,notes:string|null,studio_quality:number,has_background:number,loudness_lufs:number|null}} Clip */
+/** @typedef {{id:number,filepath:string,audio_url:string,description:string,category:string,intensity:number|null,gender:string|null,duration_sec:number,gain_db:number|null,score:number,verified:number,commercial_ok:number,target_use:string,clip_kind:string,license:string,transcript:string|null,language:string|null,speaker_id:string|null,notes:string|null,studio_quality:number,has_background:number,loudness_lufs:number|null,annotated_fields:string}} Clip */
 
 const BASE = ''
 
@@ -44,6 +44,7 @@ export const api = {
   /** @param {object} body */
   search: (body) => request('/api/search', { method: 'POST', body: JSON.stringify(body) }),
   categories: (use) => request(`/api/categories${qs({ use })}`),
+  languages: (use) => request(`/api/languages${qs({ use })}`),
 
   clip: (id) => request(`/api/clips/${id}`),
   waveform: (id, points = 400) => request(`/api/clips/${id}/waveform${qs({ points })}`),
@@ -58,7 +59,18 @@ export const api = {
   deleteClip: (id, deleteFile = false) =>
     request(`/api/clips/${id}${qs({ delete_file: deleteFile })}`, { method: 'DELETE' }),
 
-  previewImport: (path, kind) => request(`/api/import/preview${qs({ path, kind })}`),
+  /** 批量清空人工标注：传 clip_ids，或 by_filter + 筛选条件（与 search 同一套字段） */
+  clearAnnotations: (body) =>
+    request('/api/annotations/clear', { method: 'POST', body: JSON.stringify(body) }),
+
+  previewImport: (path, kind, categoryLevel) =>
+    request(
+      `/api/import/preview${qs({
+        path,
+        kind,
+        category_level: categoryLevel,
+      })}`,
+    ),
   startImport: (body) => request('/api/import', { method: 'POST', body: JSON.stringify(body) }),
   jobs: () => request('/api/jobs'),
   job: (id) => request(`/api/jobs/${id}`),

@@ -24,6 +24,7 @@ const query = reactive({
   q: '',
   categories: [],
   gender: null,
+  language: null,
   min_intensity: 0,
   duration: [3, 15],
   commercial_only: false,
@@ -36,10 +37,12 @@ const query = reactive({
 const uses = computed(() => props.meta?.uses || [])
 const result = ref({ total: 0, items: [], returned: 0 })
 const categories = ref([])
+const languages = ref([])
 const loading = ref(false)
 /** 任一请求在飞时为真：控制整体「更新中」提示与交互禁用 */
 const pending = ref(false)
 const exporting = ref(false)
+const clearing = ref(false)
 const errorText = ref('')
 const toast = ref('')
 const selected = reactive(new Set())
@@ -67,23 +70,76 @@ async function loadCategories({ force = false } = {}) {
   const use = query.use
   try {
     if (use === 'all') {
-      // 全库：把两条线路的类别合并去重
+      // 全库：把两条线路的类别合并去重。
+      // 必须保留 category_cn：它是给用户看的中文名，
+      // 只留 category 会让筛选面板重新退回英文。
       const [a, b] = await Promise.all([api.categories('indextts'), api.categories('seedvc')])
       const merged = new Map()
       for (const c of [...a.categories, ...b.categories]) {
-        merged.set(c.category, (merged.get(c.category) || 0) + c.count)
+        const prev = merged.get(c.category)
+        merged.set(c.category, {
+          category: c.category,
+          category_cn: c.category_cn || prev?.category_cn || c.category,
+          count: (prev?.count || 0) + c.count,
+        })
       }
-      categories.value = [...merged.entries()]
-        .map(([category, count]) => ({ category, count }))
-        .sort((x, y) => y.count - x.count)
+      categories.value = [...merged.values()].sort((x, y) => y.count - x.count)
     } else {
       categories.value = (await api.categories(use)).categories
     }
+    await loadLanguages(use)
     if (use === query.use) categoriesFor = use
   } catch (err) {
     // 类别拉取失败不该阻断检索；下一次切线路会重试
     categoriesFor = null
     flash(`类别加载失败：${err.message}`)
+  }
+}
+
+/** 语种分布：和类别一样按线路统计，随线路一起刷新（全库时合并两条线路） */
+async function loadLanguages(use) {
+  try {
+    if (use === 'all') {
+      const [a, b] = await Promise.all([api.languages('indextts'), api.languages('seedvc')])
+      const merged = new Map()
+      for (const l of [...a.languages, ...b.languages]) {
+        const prev = merged.get(l.language)
+        merged.set(l.language, {
+          language: l.language,
+          language_cn: l.language_cn || prev?.language_cn || l.language,
+          count: (prev?.count || 0) + l.count,
+        })
+      }
+      languages.value = [...merged.values()].sort((x, y) => y.count - x.count)
+    } else {
+      languages.value = (await api.languages(use)).languages
+    }
+  } catch (err) {
+    // 语种只是筛选辅助，失败时留空即可，不打断检索
+    languages.value = []
+    flash(`语种加载失败：${err.message}`)
+  }
+}
+
+/**
+ * 把 query 转成后端筛选条件。
+ * 检索与「清空当前筛选下的标注」共用这一份 —— 两处各写一份的话，
+ * 迟早出现「界面筛出 30 条、却清掉了别的批次」。
+ * top_k / offset / sort 只影响呈现，不属于筛选条件。
+ */
+function filterBody(extra = {}) {
+  const current = { ...query }
+  return {
+    use: current.use === 'all' ? 'all' : current.use,
+    categories: current.categories.length ? current.categories : null,
+    gender: current.gender,
+    // 空串是「未标注」（后端翻成 IS NULL），null 才是不限
+    language: current.language ?? null,
+    min_intensity: current.min_intensity > 0 ? current.min_intensity : null,
+    duration: current.duration?.length === 2 ? current.duration : null,
+    commercial_only: current.commercial_only,
+    verified_only: current.verified_only,
+    ...extra,
   }
 }
 
@@ -96,14 +152,8 @@ async function runSearch({ keepSelection = false } = {}) {
   const current = { ...query }
   try {
     const body = {
-      use: current.use === 'all' ? 'all' : current.use,
+      ...filterBody(),
       q: current.q?.trim() || null,
-      categories: current.categories.length ? current.categories : null,
-      gender: current.gender,
-      min_intensity: current.min_intensity > 0 ? current.min_intensity : null,
-      duration: current.duration?.length === 2 ? current.duration : null,
-      commercial_only: current.commercial_only,
-      verified_only: current.verified_only,
       top_k: current.top_k,
       offset: current.offset,
       sort: current.sort,
@@ -223,6 +273,67 @@ function selectAllVisible() {
   for (const c of result.value.items) selected.add(c.id)
 }
 
+/** 清空选中条目的人工标注（不可逆，需要确认） */
+async function clearSelectedAnnotations() {
+  if (!selected.size) return
+  const n = selected.size
+  if (!window.confirm(`清空选中的 ${n} 条素材的全部人工标注？\n\n程序标注不受影响，但人工改动无法恢复。`)) {
+    return
+  }
+  await doClear({ clip_ids: [...selected] }, `已清空选中 ${n} 条的标注`)
+}
+
+/** 清空当前筛选条件下**全部**条目的人工标注（不限当前页） */
+async function clearFilteredAnnotations() {
+  const total = result.value.total
+  if (!total) return
+  const scope = filterSummary()
+  const ok = window.confirm(
+    `清空当前筛选条件下全部 ${total} 条素材的人工标注？\n\n条件：${scope}\n\n` +
+      '注意：这会清空整批（不只是当前页），且不可恢复。',
+  )
+  if (!ok) return
+  await doClear({ by_filter: true, ...filterBody() }, `已清空 ${total} 条范围内的人工标注`)
+}
+
+/** 把当前筛选条件写成人话，避免用户在不知道范围的情况下点确认 */
+function filterSummary() {
+  const parts = []
+  const rule = uses.value.find((u) => u.value === query.use)
+  parts.push(rule ? rule.label : query.use)
+  if (query.categories.length) parts.push(`类别 ${query.categories.join(' / ')}`)
+  if (query.language !== null && query.language !== undefined) {
+    const hit = languages.value.find((l) => l.language === query.language)
+    parts.push(`语种 ${hit?.language_cn || query.language || '未标注'}`)
+  }
+  if (query.gender) parts.push(query.gender === 'male' ? '男声' : '女声')
+  if (query.min_intensity > 0) parts.push(`≥${query.min_intensity}★`)
+  if (query.duration?.length === 2) parts.push(`${query.duration[0]}–${query.duration[1]}s`)
+  if (query.commercial_only) parts.push('仅可商用')
+  if (query.verified_only) parts.push('仅已验证')
+  return parts.join('，')
+}
+
+async function doClear(body, okMsg) {
+  clearing.value = true
+  try {
+    const res = await api.clearAnnotations(body)
+    if (res.message) {
+      flash(res.message)
+      return
+    }
+    const re = res.reembedded ? `，重建向量 ${res.reembedded} 条` : ''
+    flash(`${okMsg}（${res.cleared} 个字段${re}）`)
+    // 标注清掉后字段值会回落到程序值，必须重新拉一遍才能看到
+    await runSearch({ keepSelection: true })
+    emit('changed')
+  } catch (err) {
+    flash(`清空失败：${err.message}`)
+  } finally {
+    clearing.value = false
+  }
+}
+
 const canPrev = computed(() => query.offset > 0)
 const canNext = computed(() => query.offset + query.top_k < result.value.total)
 
@@ -254,6 +365,7 @@ onMounted(async () => {
     <SearchFilter
       :uses="uses"
       :categories="categories"
+      :languages="languages"
       :model-value="query"
       :busy="pending"
       @update:model-value="onFilterUpdate"
@@ -276,6 +388,24 @@ onMounted(async () => {
         <div class="spacer" />
         <button class="tool" :disabled="!result.items.length" @click="selectAllVisible">
           选中本页
+        </button>
+        <button
+          v-if="selectedCount"
+          class="tool danger"
+          :disabled="clearing"
+          :title="'清空选中素材的全部人工标注（程序标注不受影响）'"
+          @click="clearSelectedAnnotations"
+        >
+          清空选中标注
+        </button>
+        <button
+          v-if="result.total"
+          class="tool danger"
+          :disabled="clearing"
+          :title="'清空当前筛选条件下全部素材的人工标注（不只是本页）'"
+          @click="clearFilteredAnnotations"
+        >
+          清空筛选下标注
         </button>
         <button class="tool primary" :disabled="!selectedCount || exporting" @click="exportSelected">
           {{ exporting ? '导出中…' : `导出选中 ${selectedCount} 条` }}
@@ -410,6 +540,12 @@ onMounted(async () => {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+/* 清空标注是不可逆操作：用警示色描边，但不要做成实心红块，
+   否则会和「导出」这类高频按钮抢注意力。 */
+.tool.danger {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
 }
 .tool:disabled {
   opacity: 0.5;
